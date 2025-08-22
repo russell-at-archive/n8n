@@ -1,0 +1,129 @@
+configs:
+  init.sql:
+    content: |
+      create database $PGDATABASE;
+      create user $PGUSER with encrypted password '$PGPASSWORD' SUPERUSER;
+      grant all privileges on database $PGDATABASE to $PGUSER;
+      \connect $PGDATABASE postgres
+      grant all on schema public to $PGUSER;
+
+      create database n8n;
+      grant all privileges on database n8n to $PGUSER;
+      \connect n8n postgres
+      grant all on schema public to $PGUSER;
+
+      CREATE EXTENSION IF NOT EXISTS vectorscale CASCADE;
+      CREATE EXTENSION IF NOT EXISTS ai CASCADE;
+  pgpass:
+    content: timescaledb:5432:*:${PGUSER}:${PGPASSWORD}
+  servers.json:
+    content: |
+      {
+        "Servers": {
+          "1": {
+            "Group": "Servers",
+            "Name": "Docker Compose",
+            "Host": "timescaledb",
+            "Port": 5432,
+            "MaintenanceDB": "postgres",
+            "Username": "${PGUSER}",
+            "PassFile": "/.pgpass",
+            "SSLMode": "prefer"
+          }
+        }
+      }
+
+services:
+
+  n8n:
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: timescaledb
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: ${PGUSER}
+      DB_POSTGRESDB_PASSWORD: ${PGPASSWORD}
+      WEBHOOK_URL: https://whole-ladybird-freely.ngrok-free.app
+    image: docker.n8n.io/n8nio/n8n:1.81.4
+    ports:
+      - 5678:5678
+    restart: always
+    volumes:
+      - .volumes/n8n:/home/node/.n8n
+
+  ngrok:
+    command:
+      - "http"
+      - "--url=whole-ladybird-freely.ngrok-free.app"
+      - "http://host.docker.internal:5678"
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}
+    image: ngrok/ngrok:latest
+    ports:
+      - 4040:4040
+
+  neo4j:
+    command: ['neo4j', '-D', 'neo4j.ext.udc.enabled=false']
+    environment:
+      - NEO4J_AUTH=neo4j/${PGADMINPASSWORD}
+      - NEO4J_dbms_security_auth__minimum__password__length=6
+      - NEO4J_PLUGINS=["apoc", "apoc-extended", "graph-data-science"]
+    image: neo4j:latest
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - .volumes/neo4j:/data
+
+  pgadmin:
+    configs:
+      - source: servers.json
+        target: /pgadmin4/servers.json
+      - source: pgpass
+        target: /var/lib/pgadmin/storage/${PGADMINDIR}/.pgpass
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    entrypoint: |
+      /bin/sh -c "chown pgadmin:root /var/lib/pgadmin/storage/${PGADMINDIR}/.pgpass; chmod 600 /var/lib/pgadmin/storage/${PGADMINDIR}/.pgpass; /entrypoint.sh;"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMINEMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMINPASSWORD}
+    image: dpage/pgadmin4:9.1
+    ports:
+      - 8081:80
+    restart: always
+    user: root
+    volumes:
+      - .volumes/pgadmin:/var/lib/pgadmin
+
+  timescaledb:
+    command: [ "-c", "ai.ollama_host=http://host.docker.internal:11434" ]
+    configs:
+      - source: init.sql
+        target: /docker-entrypoint-initdb.d/init.sql
+    environment:
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${PGUSER} -d ${PGDATABASE}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    image: timescale/timescaledb-ha:pg17
+    ports:
+      - 5432:5432
+    volumes:
+      - .volumes/timescaledb:/home/postgres/pgdata
+
+  vectorizer-worker:
+    command: [ "--poll-interval", "5s", "--log-level", "ERROR" ]
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://host.docker.internal:11434
+      PGAI_VECTORIZER_WORKER_DB_URL: postgres://${PGUSER}:${PGPASSWORD}@timescaledb:${PGPORT}/${PGDATABASE}
+    image: timescale/pgai-vectorizer-worker:latest
